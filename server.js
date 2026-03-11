@@ -1,6 +1,6 @@
 /**
- * Family Trip Planner - Production Backend Server (v5 - Secure KML Drop)
- * תומך בסנכרון מלא והעלאת קבצים, כולל שאיבת מפות KML מתוך כספת הדרייב ללא חשיפה פומבית.
+ * Family Trip Planner - Production Backend Server (Final)
+ * תומך בסנכרון מול Google Sheets ושאיבת מפות KML מכל מקום ב-Google Drive של הרובוט.
  */
 
 const express = require('express');
@@ -11,7 +11,7 @@ const { XMLParser } = require('fast-xml-parser');
 
 const app = express();
 app.use(cors());
-// הרחבת מגבלת הגודל כדי לאפשר קבלת קבצי תמונה ב-Base64
+// הרחבת מגבלת הגודל כדי לאפשר קבלת קבצי תמונה ב-Base64 מתוך ה"כספת"
 app.use(express.json({ limit: '50mb' }));
 
 // פונקציית עזר ליצירת חיבור מאומת לגוגל (Sheets + Drive)
@@ -22,7 +22,7 @@ const getGoogleAuth = () => {
     scopes: [
         'https://www.googleapis.com/auth/spreadsheets',
         'https://www.googleapis.com/auth/drive.file',
-        'https://www.googleapis.com/auth/drive.readonly' // נדרש כדי לקרוא את קבצי ה-KML
+        'https://www.googleapis.com/auth/drive.readonly' // הרשאה קריטית לשאיבת המפות
     ]
   });
 };
@@ -47,37 +47,31 @@ const ensureSheetsExist = async (sheets, spreadsheetId) => {
 };
 
 // פונקציה ייעודית לשליפת מפת ה-KML מתוך ה-Drive
-const getMapLocationsFromDrive = async (drive, folderId) => {
-    if (!folderId) return [];
-    
+// הפונקציה הזו עודכנה כך שתחפש בכל הקבצים ששותפו עם הרובוט, ולא תהיה מוגבלת לתיקייה.
+const getMapLocationsFromDrive = async (drive) => {
     try {
-        // 1. חיפוש קבצי KML בתוך התיקייה הייעודית, מיון לפי תאריך יצירה (החדש ביותר קודם)
         const res = await drive.files.list({
-            q: `'${folderId}' in parents and name contains '.kml' and trashed = false`,
+            q: `name contains '.kml' and trashed = false`,
             fields: 'files(id, name, createdTime)',
             orderBy: 'createdTime desc',
         });
 
         if (!res.data.files || res.data.files.length === 0) {
-            return []; // לא נמצאו קבצי מפה
+            return [];
         }
 
         const latestKmlFile = res.data.files[0];
         console.log(`🤖 Found KML map file: ${latestKmlFile.name}`);
 
-        // 2. הורדת תוכן הקובץ
         const fileRes = await drive.files.get(
             { fileId: latestKmlFile.id, alt: 'media' },
             { responseType: 'text' }
         );
         
         const kmlText = fileRes.data;
-        
-        // 3. פיענוח ה-XML
         const parser = new XMLParser({ ignoreAttributes: false });
         const jsonObj = parser.parse(kmlText);
 
-        // 4. חילוץ הנעצים (רקורסיבי כי KML יכול להכיל תיקיות מקוננות)
         const extractPlacemarks = (obj) => {
             let places = [];
             if (!obj) return places;
@@ -89,7 +83,6 @@ const getMapLocationsFromDrive = async (drive, folderId) => {
                     pArr.forEach(p => {
                         if (p.name && p.Point && p.Point.coordinates) {
                             const coords = p.Point.coordinates.trim().split(',');
-                            // KML stores as: longitude,latitude,altitude
                             places.push({ name: p.name, lat: coords[1], lng: coords[0] });
                         }
                     });
@@ -116,16 +109,15 @@ app.get('/api/sync', async (req, res) => {
     const sheets = google.sheets({ version: 'v4', auth });
     const drive = google.drive({ version: 'v3', auth });
     const spreadsheetId = process.env.SPREADSHEET_ID;
-    const folderId = process.env.DRIVE_FOLDER_ID; // התיקייה בדרייב
 
     await ensureSheetsExist(sheets, spreadsheetId);
 
-    // משיכת נתונים מהאקסל וקובץ ה-KML מהדרייב במקביל לביצועים מהירים
+    // משיכת נתונים במקביל לשיפור ביצועים (כולל קריאת מפת ה-KML)
     const [tripRes, packingRes, vaultRes, mapLocations] = await Promise.all([
         sheets.spreadsheets.values.get({ spreadsheetId, range: 'TripData!A2:H' }).catch(() => ({ data: { values: [] } })),
         sheets.spreadsheets.values.get({ spreadsheetId, range: 'PackingData!A2:C' }).catch(() => ({ data: { values: [] } })),
         sheets.spreadsheets.values.get({ spreadsheetId, range: 'VaultData!A2:D' }).catch(() => ({ data: { values: [] } })),
-        getMapLocationsFromDrive(drive, folderId) // קריאת המפה באופן מאובטח
+        getMapLocationsFromDrive(drive)
     ]);
 
     const activities = {};
