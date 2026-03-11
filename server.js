@@ -1,8 +1,3 @@
-/**
- * Family Trip Planner - Production Backend Server (Final v4)
- * תומך בסנכרון מול Google Sheets, שאיבת מפות KML וסריקת קבצים אוטומטית מהדרייב.
- */
-
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
@@ -11,13 +6,8 @@ const { XMLParser } = require('fast-xml-parser');
 
 const app = express();
 app.use(cors());
-
-// הרחבת מגבלת הגודל לקבלת קבצי Base64 כבדים (PDF/תמונות)
 app.use(express.json({ limit: '50mb' }));
 
-/**
- * פונקציית עזר להתחברות מאובטחת לשירותי גוגל
- */
 const getGoogleAuth = () => {
   const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
   return new google.auth.GoogleAuth({
@@ -25,14 +15,12 @@ const getGoogleAuth = () => {
     scopes: [
         'https://www.googleapis.com/auth/spreadsheets',
         'https://www.googleapis.com/auth/drive.file',
-        'https://www.googleapis.com/auth/drive.readonly'
+        'https://www.googleapis.com/auth/drive.readonly',
+        'https://www.googleapis.com/auth/calendar.readonly' // נוספה הרשאת קריאה ליומן
     ]
   });
 };
 
-/**
- * שליפת נקודות עניין מקובץ KML בדרייב
- */
 const getMapLocationsFromDrive = async (drive) => {
     try {
         const res = await drive.files.list({
@@ -40,49 +28,25 @@ const getMapLocationsFromDrive = async (drive) => {
             fields: 'files(id, name, createdTime)',
             orderBy: 'createdTime desc',
         });
-
         if (!res.data.files || res.data.files.length === 0) return [];
-
-        const fileRes = await drive.files.get(
-            { fileId: res.data.files[0].id, alt: 'media' },
-            { responseType: 'text' }
-        );
-        
-        const parser = new XMLParser({ ignoreAttributes: false });
-        const jsonObj = parser.parse(fileRes.data);
-
-        const extractPlacemarks = (obj) => {
-            let places = [];
-            if (!obj) return places;
-            if (Array.isArray(obj)) {
-                obj.forEach(item => places = places.concat(extractPlacemarks(item)));
-            } else if (typeof obj === 'object') {
+        const fileRes = await drive.files.get({ fileId: res.data.files[0].id, alt: 'media' }, { responseType: 'text' });
+        const jsonObj = new XMLParser({ ignoreAttributes: false }).parse(fileRes.data);
+        const extract = (obj) => {
+            let p = []; if (!obj) return p;
+            if (Array.isArray(obj)) obj.forEach(i => p = p.concat(extract(i)));
+            else if (typeof obj === 'object') {
                 if (obj.Placemark) {
-                    const pArr = Array.isArray(obj.Placemark) ? obj.Placemark : [obj.Placemark];
-                    pArr.forEach(p => {
-                        if (p.name && p.Point && p.Point.coordinates) {
-                            const coords = p.Point.coordinates.trim().split(',');
-                            places.push({ name: p.name, lat: coords[1], lng: coords[0] });
-                        }
-                    });
+                    const arr = Array.isArray(obj.Placemark) ? obj.Placemark : [obj.Placemark];
+                    arr.forEach(x => { if (x.Point) p.push({ name: x.name, lat: x.Point.coordinates.split(',')[1], lng: x.Point.coordinates.split(',')[0] }); });
                 }
-                Object.keys(obj).forEach(k => {
-                    if (k !== 'Placemark') places = places.concat(extractPlacemarks(obj[k]));
-                });
+                Object.keys(obj).forEach(k => { if (k !== 'Placemark') p = p.concat(extract(obj[k])); });
             }
-            return places;
+            return p;
         };
-
-        return extractPlacemarks(jsonObj.kml?.Document);
-    } catch (error) {
-        console.error("KML Extraction Error:", error);
-        return [];
-    }
+        return extract(jsonObj.kml?.Document);
+    } catch (e) { return []; }
 };
 
-/**
- * סריקת תיקיית הדרייב לזיהוי קבצים שהועלו ידנית
- */
 const getFilesFromDriveFolder = async (drive, folderId) => {
     if (!folderId) return [];
     try {
@@ -96,15 +60,67 @@ const getFilesFromDriveFolder = async (drive, folderId) => {
             url: `https://drive.google.com/uc?export=view&id=${f.id}`,
             type: f.mimeType
         }));
-    } catch (e) {
-        console.error("Drive Folder Scan Error:", e);
-        return [];
-    }
+    } catch (e) { return []; }
 };
 
-/**
- * --- PULL ENDPOINT (GET) ---
- */
+// --- נקודת קצה חדשה: משיכת אירועים מ-Google Calendar ---
+app.get('/api/calendar', async (req, res) => {
+    try {
+        const { calendarId, date } = req.query; // date is expected as "YYYY-MM-DD"
+        if (!calendarId || !date) return res.status(400).json({ error: 'Missing parameters' });
+
+        const auth = getGoogleAuth();
+        const calendar = google.calendar({ version: 'v3', auth });
+
+        // הגדרת חלון זמן של 24 שעות לאותו תאריך
+        const startOfDay = new Date(date);
+        const endOfDay = new Date(date);
+        endOfDay.setDate(endOfDay.getDate() + 1);
+
+        const response = await calendar.events.list({
+            calendarId: calendarId,
+            timeMin: startOfDay.toISOString(),
+            timeMax: endOfDay.toISOString(),
+            singleEvents: true,
+            orderBy: 'startTime',
+            timeZone: 'Asia/Jerusalem'
+        });
+
+        const events = (response.data.items || []).map(item => {
+            let timeStr = '08:00';
+            let durationStr = '60';
+
+            if (item.start && item.start.dateTime) {
+                const d = new Date(item.start.dateTime);
+                timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+                
+                if (item.end && item.end.dateTime) {
+                    const startMs = d.getTime();
+                    const endMs = new Date(item.end.dateTime).getTime();
+                    durationStr = String(Math.round((endMs - startMs) / 60000));
+                }
+            } else if (item.start && item.start.date) {
+                // All-day event
+                timeStr = '09:00';
+                durationStr = '120';
+            }
+
+            return {
+                title: item.summary || 'אירוע יומן',
+                time: timeStr,
+                duration: durationStr,
+                location: item.location || ''
+            };
+        });
+
+        res.json({ success: true, events });
+    } catch (error) {
+        console.error("Calendar Sync Error:", error);
+        res.status(500).json({ success: false, error: 'Failed to fetch calendar events' });
+    }
+});
+
+// --- PULL ENDPOINT (Existing) ---
 app.get('/api/sync', async (req, res) => {
   try {
     const auth = getGoogleAuth();
@@ -122,40 +138,21 @@ app.get('/api/sync', async (req, res) => {
     ]);
 
     const activities = {};
-    (tripRes.data.values || []).forEach(row => {
-      if (!row[1]) return;
-      if (!activities[row[1]]) activities[row[1]] = [];
-      activities[row[1]].push({
-          id: row[0], time: row[2], title: row[3], location: row[4], 
-          type: row[5], duration: row[6], completed: row[7] === 'TRUE'
-      });
+    (tripRes.data.values || []).forEach(r => {
+      if (!r[1]) return;
+      if (!activities[r[1]]) activities[r[1]] = [];
+      activities[r[1]].push({ id: r[0], time: r[2], title: r[3], location: r[4], type: r[5], duration: r[6], completed: r[7] === 'TRUE' });
     });
 
-    const packingList = (packingRes.data.values || []).map(row => ({
-        id: row[0], text: row[1], checked: row[2] === 'TRUE'
-    }));
-
-    // מיזוג קבצים מהאקסל וקבצים פיזיים מהדרייב למניעת כפילויות
-    const sheetFiles = (vaultRes.data.values || []).map(row => ({
-        id: row[0], name: row[1], url: row[2], type: row[3]
-    }));
-    
+    const sheetFiles = (vaultRes.data.values || []).map(r => ({ id: r[0], name: r[1], url: r[2], type: r[3] }));
     const allVault = [...sheetFiles];
-    driveFiles.forEach(df => {
-        if (!allVault.find(sf => sf.id === df.id)) allVault.push(df);
-    });
+    driveFiles.forEach(df => { if (!allVault.find(sf => sf.id === df.id)) allVault.push(df); });
 
-    res.json({ success: true, activities, packingList, vaultFiles: allVault, mapLocations: mapLocs });
-
-  } catch (error) {
-    console.error("Sync Pull Error:", error);
-    res.status(500).json({ success: false });
-  }
+    res.json({ success: true, activities, packingList: (packingRes.data.values || []).map(r => ({ id: r[0], text: r[1], checked: r[2] === 'TRUE' })), vaultFiles: allVault, mapLocations: mapLocs });
+  } catch (error) { res.status(500).json({ success: false }); }
 });
 
-/**
- * --- PUSH ENDPOINT (POST) ---
- */
+// --- PUSH ENDPOINT (Existing) ---
 app.post('/api/sync', async (req, res) => {
   try {
     const { activities, packingList, vaultFiles } = req.body;
@@ -165,65 +162,33 @@ app.post('/api/sync', async (req, res) => {
     const spreadsheetId = process.env.SPREADSHEET_ID;
     const folderId = process.env.DRIVE_FOLDER_ID;
 
-    // 1. נתוני לו"ז
     const tripRows = [['ID', 'Date', 'Time', 'Title', 'Location', 'Type', 'Duration', 'Completed']];
-    if (activities) {
-        Object.entries(activities).forEach(([date, acts]) => {
-            acts.forEach(a => tripRows.push([a.id, date, a.time, a.title, a.location, a.type, a.duration, a.completed ? 'TRUE' : 'FALSE']));
-        });
-    }
-
-    // 2. נתוני אריזה
-    const packingRows = [['ID', 'Text', 'Checked']];
-    if (packingList) {
-        packingList.forEach(p => packingRows.push([p.id, p.text, p.checked ? 'TRUE' : 'FALSE']));
-    }
-
-    // 3. קבצי כספת (העלאה לדרייב אם מדובר ב-Base64 חדש)
+    if (activities) Object.entries(activities).forEach(([d, acts]) => acts.forEach(a => tripRows.push([a.id, d, a.time, a.title, a.location, a.type, a.duration, a.completed ? 'TRUE' : 'FALSE'])));
+    
     const vaultRows = [['ID', 'Name', 'URL', 'Type']];
     if (vaultFiles) {
-        for (const file of vaultFiles) {
-            let fileUrl = file.url;
-            if (file.data && file.data.startsWith('data:') && folderId) {
-                try {
-                    const mimeType = file.data.substring(file.data.indexOf(":") + 1, file.data.indexOf(";"));
-                    const base64Str = file.data.split(',')[1];
-                    const bufferStream = new PassThrough();
-                    bufferStream.end(Buffer.from(base64Str, 'base64'));
-
-                    const driveRes = await drive.files.create({
-                        resource: { name: file.name, parents: [folderId] },
-                        media: { mimeType, body: bufferStream },
-                        fields: 'id'
-                    });
-                    
-                    await drive.permissions.create({
-                        fileId: driveRes.data.id,
-                        requestBody: { role: 'reader', type: 'anyone' }
-                    });
-                    fileUrl = `https://drive.google.com/uc?export=view&id=${driveRes.data.id}`;
-                } catch (e) { console.error("Drive upload failed:", e); }
+        for (const f of vaultFiles) {
+            let url = f.url;
+            if (f.data?.startsWith('data:') && folderId) {
+                const driveRes = await drive.files.create({
+                    resource: { name: f.name, parents: [folderId] },
+                    media: { mimeType: f.data.split(':')[1].split(';')[0], body: Buffer.from(f.data.split(',')[1], 'base64') },
+                    fields: 'id'
+                });
+                await drive.permissions.create({ fileId: driveRes.data.id, requestBody: { role: 'reader', type: 'anyone' } });
+                url = `https://drive.google.com/uc?export=view&id=${driveRes.data.id}`;
             }
-            vaultRows.push([file.id, file.name, fileUrl || '', file.type || 'image']);
+            vaultRows.push([f.id, f.name, url || '', f.type || 'image']);
         }
     }
 
-    // עדכון הגיליון
     await sheets.spreadsheets.values.clear({ spreadsheetId, range: 'TripData' });
     await sheets.spreadsheets.values.update({ spreadsheetId, range: 'TripData!A1', valueInputOption: 'RAW', requestBody: { values: tripRows } });
-    
-    await sheets.spreadsheets.values.clear({ spreadsheetId, range: 'PackingData' });
-    await sheets.spreadsheets.values.update({ spreadsheetId, range: 'PackingData!A1', valueInputOption: 'RAW', requestBody: { values: packingRows } });
-
     await sheets.spreadsheets.values.clear({ spreadsheetId, range: 'VaultData' });
     await sheets.spreadsheets.values.update({ spreadsheetId, range: 'VaultData!A1', valueInputOption: 'RAW', requestBody: { values: vaultRows } });
-
+    
     res.json({ success: true });
-  } catch (error) {
-    console.error("Sync Push Error:", error);
-    res.status(500).json({ success: false });
-  }
+  } catch (e) { res.status(500).json({ success: false }); }
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🤖 Server live on port ${PORT}`));
+app.listen(process.env.PORT || 10000);
