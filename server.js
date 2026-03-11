@@ -1,16 +1,17 @@
 /**
- * Family Trip Planner - Production Backend Server (v3)
- * תומך בסנכרון מלא: לו"ז, רשימות אריזה, והעלאת קבצים אוטומטית ל-Google Drive.
+ * Family Trip Planner - Production Backend Server (v5 - Secure KML Drop)
+ * תומך בסנכרון מלא והעלאת קבצים, כולל שאיבת מפות KML מתוך כספת הדרייב ללא חשיפה פומבית.
  */
 
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
 const { PassThrough } = require('stream');
+const { XMLParser } = require('fast-xml-parser');
 
 const app = express();
 app.use(cors());
-// הרחבת מגבלת הגודל כדי לאפשר קבלת קבצי תמונה ב-Base64 (דרכונים וכו')
+// הרחבת מגבלת הגודל כדי לאפשר קבלת קבצי תמונה ב-Base64
 app.use(express.json({ limit: '50mb' }));
 
 // פונקציית עזר ליצירת חיבור מאומת לגוגל (Sheets + Drive)
@@ -19,13 +20,13 @@ const getGoogleAuth = () => {
   return new google.auth.GoogleAuth({
     credentials,
     scopes: [
-        '[https://www.googleapis.com/auth/spreadsheets](https://www.googleapis.com/auth/spreadsheets)',
-        '[https://www.googleapis.com/auth/drive.file](https://www.googleapis.com/auth/drive.file)'
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive.file',
+        'https://www.googleapis.com/auth/drive.readonly' // נדרש כדי לקרוא את קבצי ה-KML
     ]
   });
 };
 
-// פונקציית תשתית: מוודאת שהלשוניות קיימות באקסל ויוצרת אותן אם חסר
 const ensureSheetsExist = async (sheets, spreadsheetId) => {
     try {
         const doc = await sheets.spreadsheets.get({ spreadsheetId });
@@ -40,14 +41,71 @@ const ensureSheetsExist = async (sheets, spreadsheetId) => {
         }
 
         if (requests.length > 0) {
-            await sheets.spreadsheets.batchUpdate({
-                spreadsheetId,
-                requestBody: { requests }
-            });
-            console.log("🤖 Created missing tabs in Google Sheets.");
+            await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } });
         }
-    } catch (e) {
-        console.error("Error checking sheets existence:", e);
+    } catch (e) { console.error("Error checking sheets:", e); }
+};
+
+// פונקציה ייעודית לשליפת מפת ה-KML מתוך ה-Drive
+const getMapLocationsFromDrive = async (drive, folderId) => {
+    if (!folderId) return [];
+    
+    try {
+        // 1. חיפוש קבצי KML בתוך התיקייה הייעודית, מיון לפי תאריך יצירה (החדש ביותר קודם)
+        const res = await drive.files.list({
+            q: `'${folderId}' in parents and name contains '.kml' and trashed = false`,
+            fields: 'files(id, name, createdTime)',
+            orderBy: 'createdTime desc',
+        });
+
+        if (!res.data.files || res.data.files.length === 0) {
+            return []; // לא נמצאו קבצי מפה
+        }
+
+        const latestKmlFile = res.data.files[0];
+        console.log(`🤖 Found KML map file: ${latestKmlFile.name}`);
+
+        // 2. הורדת תוכן הקובץ
+        const fileRes = await drive.files.get(
+            { fileId: latestKmlFile.id, alt: 'media' },
+            { responseType: 'text' }
+        );
+        
+        const kmlText = fileRes.data;
+        
+        // 3. פיענוח ה-XML
+        const parser = new XMLParser({ ignoreAttributes: false });
+        const jsonObj = parser.parse(kmlText);
+
+        // 4. חילוץ הנעצים (רקורסיבי כי KML יכול להכיל תיקיות מקוננות)
+        const extractPlacemarks = (obj) => {
+            let places = [];
+            if (!obj) return places;
+            if (Array.isArray(obj)) {
+                obj.forEach(item => places = places.concat(extractPlacemarks(item)));
+            } else if (typeof obj === 'object') {
+                if (obj.Placemark) {
+                    const pArr = Array.isArray(obj.Placemark) ? obj.Placemark : [obj.Placemark];
+                    pArr.forEach(p => {
+                        if (p.name && p.Point && p.Point.coordinates) {
+                            const coords = p.Point.coordinates.trim().split(',');
+                            // KML stores as: longitude,latitude,altitude
+                            places.push({ name: p.name, lat: coords[1], lng: coords[0] });
+                        }
+                    });
+                }
+                Object.keys(obj).forEach(k => {
+                    if (k !== 'Placemark') places = places.concat(extractPlacemarks(obj[k]));
+                });
+            }
+            return places;
+        };
+
+        return extractPlacemarks(jsonObj.kml?.Document);
+
+    } catch (error) {
+        console.error("Failed extracting KML from Drive:", error);
+        return [];
     }
 };
 
@@ -56,15 +114,18 @@ app.get('/api/sync', async (req, res) => {
   try {
     const auth = getGoogleAuth();
     const sheets = google.sheets({ version: 'v4', auth });
+    const drive = google.drive({ version: 'v3', auth });
     const spreadsheetId = process.env.SPREADSHEET_ID;
+    const folderId = process.env.DRIVE_FOLDER_ID; // התיקייה בדרייב
 
     await ensureSheetsExist(sheets, spreadsheetId);
 
-    // משיכת נתונים מכל הלשוניות במקביל
-    const [tripRes, packingRes, vaultRes] = await Promise.all([
+    // משיכת נתונים מהאקסל וקובץ ה-KML מהדרייב במקביל לביצועים מהירים
+    const [tripRes, packingRes, vaultRes, mapLocations] = await Promise.all([
         sheets.spreadsheets.values.get({ spreadsheetId, range: 'TripData!A2:H' }).catch(() => ({ data: { values: [] } })),
         sheets.spreadsheets.values.get({ spreadsheetId, range: 'PackingData!A2:C' }).catch(() => ({ data: { values: [] } })),
-        sheets.spreadsheets.values.get({ spreadsheetId, range: 'VaultData!A2:D' }).catch(() => ({ data: { values: [] } }))
+        sheets.spreadsheets.values.get({ spreadsheetId, range: 'VaultData!A2:D' }).catch(() => ({ data: { values: [] } })),
+        getMapLocationsFromDrive(drive, folderId) // קריאת המפה באופן מאובטח
     ]);
 
     const activities = {};
@@ -75,15 +136,10 @@ app.get('/api/sync', async (req, res) => {
       activities[date].push({ id, time, title, location, type, duration, completed: completed === 'TRUE' });
     });
 
-    const packingList = (packingRes.data.values || []).map(row => ({
-        id: row[0], text: row[1], checked: row[2] === 'TRUE'
-    }));
+    const packingList = (packingRes.data.values || []).map(row => ({ id: row[0], text: row[1], checked: row[2] === 'TRUE' }));
+    const vaultFiles = (vaultRes.data.values || []).map(row => ({ id: row[0], name: row[1], url: row[2], type: row[3] }));
 
-    const vaultFiles = (vaultRes.data.values || []).map(row => ({
-        id: row[0], name: row[1], url: row[2], type: row[3]
-    }));
-
-    res.json({ success: true, activities, packingList, vaultFiles });
+    res.json({ success: true, activities, packingList, vaultFiles, mapLocations });
 
   } catch (error) {
     console.error("Pull Error:", error);
@@ -99,11 +155,10 @@ app.post('/api/sync', async (req, res) => {
     const sheets = google.sheets({ version: 'v4', auth });
     const drive = google.drive({ version: 'v3', auth });
     const spreadsheetId = process.env.SPREADSHEET_ID;
-    const folderId = process.env.DRIVE_FOLDER_ID; // מוגדר במשתני הסביבה ב-Render
+    const folderId = process.env.DRIVE_FOLDER_ID;
 
     await ensureSheetsExist(sheets, spreadsheetId);
 
-    // 1. הכנת נתוני לו"ז
     const tripRows = [['ID', 'Date', 'Time', 'Title', 'Location', 'Type', 'Duration', 'Completed']];
     if (activities) {
         for (const [date, acts] of Object.entries(activities)) {
@@ -111,19 +166,13 @@ app.post('/api/sync', async (req, res) => {
         }
     }
 
-    // 2. הכנת נתוני אריזה
     const packingRows = [['ID', 'Text', 'Checked']];
-    if (packingList) {
-        packingList.forEach(p => packingRows.push([p.id, p.text, p.checked ? 'TRUE' : 'FALSE']));
-    }
+    if (packingList) packingList.forEach(p => packingRows.push([p.id, p.text, p.checked ? 'TRUE' : 'FALSE']));
 
-    // 3. טיפול בקבצי כספת (העלאה לדרייב אם צריך)
     const vaultRows = [['ID', 'Name', 'URL', 'Type']];
     if (vaultFiles) {
         for (const file of vaultFiles) {
             let fileUrl = file.url;
-            
-            // אם הקובץ מכיל דאטה בייס64, סימן שזה קובץ חדש שיש להעלות לדרייב
             if (file.data && file.data.startsWith('data:') && folderId) {
                 try {
                     const mimeType = file.data.substring(file.data.indexOf(":") + 1, file.data.indexOf(";"));
@@ -137,23 +186,17 @@ app.post('/api/sync', async (req, res) => {
                         fields: 'id'
                     });
                     
-                    // מתן הרשאת קריאה ציבורית (כדי שהאפליקציה תוכל להציג את התמונה מכל טלפון)
                     await drive.permissions.create({
                         fileId: driveRes.data.id,
                         requestBody: { role: 'reader', type: 'anyone' }
                     });
-
-                    // יצירת לינק ישיר להורדה/תצוגה שמתאים ל-img tag
                     fileUrl = `https://drive.google.com/uc?export=view&id=${driveRes.data.id}`;
-                } catch (e) {
-                    console.error("Drive upload failed for file:", file.name, e);
-                }
+                } catch (e) { console.error("Drive upload failed:", e); }
             }
             vaultRows.push([file.id, file.name, fileUrl || '', file.type || 'image']);
         }
     }
 
-    // 4. כתיבת כל הנתונים במרוכז לאקסל
     await sheets.spreadsheets.values.clear({ spreadsheetId, range: 'TripData' });
     await sheets.spreadsheets.values.clear({ spreadsheetId, range: 'PackingData' });
     await sheets.spreadsheets.values.clear({ spreadsheetId, range: 'VaultData' });
@@ -162,8 +205,7 @@ app.post('/api/sync', async (req, res) => {
     await sheets.spreadsheets.values.update({ spreadsheetId, range: 'PackingData!A1', valueInputOption: 'RAW', requestBody: { values: packingRows } });
     await sheets.spreadsheets.values.update({ spreadsheetId, range: 'VaultData!A1', valueInputOption: 'RAW', requestBody: { values: vaultRows } });
 
-    res.json({ success: true, message: 'All systems perfectly synced!' });
-
+    res.json({ success: true, message: 'All systems synced!' });
   } catch (error) {
     console.error("Push Error:", error);
     res.status(500).json({ success: false, error: 'Failed to push data.' });
