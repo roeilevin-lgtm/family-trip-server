@@ -72,10 +72,11 @@ app.get('/api/calendar', async (req, res) => {
         const auth = getGoogleAuth();
         const calendar = google.calendar({ version: 'v3', auth });
 
-        // הגדרת חלון זמן של 24 שעות לאותו תאריך
+        // הגדרת חלון זמן של 24 שעות לאותו תאריך (לפי שעון ישראל)
         const startOfDay = new Date(date);
+        startOfDay.setHours(0,0,0,0);
         const endOfDay = new Date(date);
-        endOfDay.setDate(endOfDay.getDate() + 1);
+        endOfDay.setHours(23,59,59,999);
 
         const response = await calendar.events.list({
             calendarId: calendarId,
