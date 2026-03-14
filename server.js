@@ -107,6 +107,7 @@ app.get('/api/calendar', async (req, res) => {
             }
 
             return {
+                id: item.id,
                 title: item.summary || 'אירוע יומן',
                 time: timeStr,
                 duration: durationStr,
